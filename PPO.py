@@ -40,13 +40,15 @@ class Critic(nn.Module):
 
         self.C1 = nn.Linear(state_dim, net_width)
         self.C2 = nn.Linear(net_width, net_width)
-        self.C3 = nn.Linear(net_width, 1)
+        self.Ch = nn.Linear(net_width, 1)
+        self.Cp = nn.Linear(net_width, 1)
 
     def forward(self, state):
         v = torch.relu(self.C1(state))
         v = torch.relu(self.C2(v))
-        v = self.C3(v)
-        return v
+        vh = self.Ch(v)
+        vp = self.Cp(v)
+        return vh, vp
 
 
 
@@ -106,29 +108,41 @@ class PPO_discrete(object):
 
 
     def train(self):
-        s, a, r, s_prime, old_prob_a,done_mask,dw_mask = self.make_batch()
+        s, a, rh, rp, s_prime, old_prob_a,done_mask,dw_mask = self.make_batch()
         self.entropy_coef *= self.entropy_coef_decay #exploring decay
 
         ''' Use TD+GAE+LongTrajectory to compute Advantage and TD target'''
         with torch.no_grad():
-            vs = self.critic(s)
-            vs_ = self.critic(s_prime)
+            #vs = self.critic(s)
+            vh, vp = self.critic(s)
+            vh_, vp_ = self.critic(s_prime)
 
             '''dw(dead and win) for TD_target and Adv'''
-            deltas = r + self.gamma * vs_ * (1 - dw_mask) - vs
-            deltas = deltas.cpu().flatten().numpy()
-            adv = [0]
+            deltash = rh + self.gamma * vh_ * (1 - dw_mask) - vh
+            deltasp = rp + self.gamma * vp_ * (1 - dw_mask) - vp
+            deltash = deltash.cpu().flatten().numpy()
+            deltasp = deltasp.cpu().flatten().numpy()
+            advh = [0]
+            advp = [0]
 
             '''done for GAE'''
-            for dlt, mask in zip(deltas[::-1], done_mask.cpu().flatten().numpy()[::-1]):
-                advantage = dlt + self.gamma * self.lambd * adv[-1] * (1 - mask)
-                adv.append(advantage)
-            adv.reverse()
-            adv = copy.deepcopy(adv[0:-1])
-            adv = torch.tensor(adv).unsqueeze(1).float().to(device)
-            td_target = adv + vs
-            if self.adv_normalization:
-                adv = (adv - adv.mean()) / ((adv.std() + 1e-4))  #useful in some envs
+            for dlth, mask in zip(deltash[::-1], done_mask.cpu().flatten().numpy()[::-1]):
+                advantageh = dlth + self.gamma * self.lambd * advh[-1] * (1 - mask)
+                advh.append(advantageh)
+            for dltp, mask in zip(deltasp[::-1], done_mask.cpu().flatten().numpy()[::-1]):
+                advantagep = dltp + self.gamma * self.lambd * advp[-1] * (1 - mask)
+                advp.append(advantagep)
+            advh.reverse()
+            advh = copy.deepcopy(advh[0:-1])
+            advh = torch.tensor(advh).unsqueeze(1).float().to(device)
+
+            advp.reverse()
+            advp = copy.deepcopy(advp[0:-1])
+            advp = torch.tensor(advp).unsqueeze(1).float().to(device)
+
+            td_target = (advh + vh, advp+vp)
+
+
 
         """PPO update"""
         #Slice long trajectopy into short trajectory and perform mini-batch PPO update
@@ -139,8 +153,8 @@ class PPO_discrete(object):
             perm = np.arange(s.shape[0])
             np.random.shuffle(perm)
             perm = torch.LongTensor(perm).to(device)
-            s, a, td_target, adv, old_prob_a = \
-                s[perm].clone(), a[perm].clone(), td_target[perm].clone(), adv[perm].clone(), old_prob_a[perm].clone()
+            s, a, td_target, advh, advp, old_prob_a = \
+                s[perm].clone(), a[perm].clone(), td_target[perm].clone(), advh[perm].clone(), advp[perm].clone(), old_prob_a[perm].clone()
 
             '''mini-batch PPO update'''
             for i in range(optim_iter_num):
@@ -152,8 +166,8 @@ class PPO_discrete(object):
                 prob_a = prob.gather(1, a[index])
                 ratio = torch.exp(torch.log(prob_a) - torch.log(old_prob_a[index]))  # a/b == exp(log(a)-log(b))
 
-                surr1 = ratio * adv[index]
-                surr2 = torch.clamp(ratio, 1 - self.clip_rate, 1 + self.clip_rate) * adv[index]
+                surr1 = ratio * (advh[index]+advp[index])
+                surr2 = torch.clamp(ratio, 1 - self.clip_rate, 1 + self.clip_rate) * (advh[index]+advp[index])
                 a_loss = -torch.min(surr1, surr2) - self.entropy_coef * entropy
 
                 self.actor_optimizer.zero_grad()
@@ -162,7 +176,9 @@ class PPO_discrete(object):
                 self.actor_optimizer.step()
 
                 '''critic update'''
-                c_loss = (self.critic(s[index]) - td_target[index]).pow(2).mean()
+                v_h, v_p = self.critic(s[index])
+                c_loss = (v_h - td_target[index][0]).pow(2).mean() + (v_p - td_target[index][1]).pow(2).mean()
+                #c_loss = (self.critic(s[index]) - td_target[index]).pow(2).mean()
                 for name, param in self.critic.named_parameters():
                     if 'weight' in name:
                         c_loss += param.pow(2).sum() * self.l2_reg
@@ -174,11 +190,11 @@ class PPO_discrete(object):
 
     def make_batch(self):
         l = len(self.data)
-        s_lst, a_lst, r_lst, s_prime_lst, prob_a_lst, done_lst, dw_lst = \
-            np.zeros((l,self.s_dim)), np.zeros((l,1)), np.zeros((l,1)), np.zeros((l,self.s_dim)), np.zeros((l,1)), np.zeros((l,1)), np.zeros((l,1))
+        s_lst, a_lst, rh_lst, rp_lst, s_prime_lst, prob_a_lst, done_lst, dw_lst = \
+            np.zeros((l,self.s_dim)), np.zeros((l,1)), np.zeros((l,1)), np.zeros((l,1)), np.zeros((l,self.s_dim)), np.zeros((l,1)), np.zeros((l,1)), np.zeros((l,1))
             
         for i,transition in enumerate(self.data):
-            s_lst[i], a_lst[i],r_lst[i] ,s_prime_lst[i] ,prob_a_lst[i] ,done_lst[i] ,dw_lst[i] = transition
+            s_lst[i], a_lst[i],rh_lst[i], rp_lst[i], s_prime_lst[i] ,prob_a_lst[i] ,done_lst[i] ,dw_lst[i] = transition
         if not self.env_with_Dead:
             '''Important!!!'''
             # env_without_DeadAndWin: deltas = r + self.gamma * vs_ - vs
@@ -189,16 +205,17 @@ class PPO_discrete(object):
 
         '''list to tensor'''
         with torch.no_grad():
-            s,a,r,s_prime,prob_a,done_mask, dw_mask = \
+            s,a,rh,rp,s_prime,prob_a,done_mask, dw_mask = \
                 torch.tensor(s_lst, dtype=torch.float).to(device), \
                 torch.tensor(a_lst, dtype=torch.int64).to(device), \
-                torch.tensor(r_lst, dtype=torch.float).to(device), \
+                torch.tensor(rh_lst, dtype=torch.float).to(device), \
+                torch.tensor(rp_lst, dtype=torch.float).to(device), \
                 torch.tensor(s_prime_lst, dtype=torch.float).to(device), \
                 torch.tensor(prob_a_lst, dtype=torch.float).to(device), \
                 torch.tensor(done_lst, dtype=torch.float).to(device), \
                 torch.tensor(dw_lst, dtype=torch.float).to(device),
 
-        return s, a, r, s_prime, prob_a,done_mask,dw_mask
+        return s, a, rh, rp, s_prime, prob_a,done_mask,dw_mask
 
     def put_data(self, transition):
         self.data.append(transition)
